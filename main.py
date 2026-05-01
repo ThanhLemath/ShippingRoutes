@@ -11,16 +11,44 @@ import xarray as xr
 from shapely.geometry import Point
 import pickle
 
-# ds = xr.open_dataset(
-#     "hrrr.20140730_conus_hrrr.t18z.wrfnatf00.grib2",
-#     engine="cfgrib",
-#     backend_kwargs={
-#         "filter_by_keys": {
-#             "typeOfLevel": "heightAboveGround",
-#             "level": 10
-#         }
-#     }
-# )
+
+ds_list = []
+for i in range(16):
+    f = f"data/hrrr.t18z.wrfnatf{i:02d}.grib2"
+    ds_list.append(
+        xr.open_dataset(
+            f,
+            engine="cfgrib",
+            backend_kwargs={
+                "filter_by_keys": {
+                    "typeOfLevel": "heightAboveGround",
+                    "level": 10
+                }
+            }
+        )
+    )
+
+
+lat_cache = [ds["latitude"].values for ds in ds_list]
+lon_cache = [ds["longitude"].values for ds in ds_list]
+u_cache   = [ds["u10"].values for ds in ds_list]
+v_cache   = [ds["v10"].values for ds in ds_list]
+
+def GetWindfromCloseCoords(time, lat0, lon0):
+
+    lat = lat_cache[time]
+    lon = lon_cache[time]
+    u10 = u_cache[time]
+    v10 = v_cache[time]
+
+    dist2 = (lat - lat0)**2 + (lon - lon0)**2
+    y, x = np.unravel_index(np.argmin(dist2), lat.shape)
+
+    u = u10[y, x]
+    v = v10[y, x]
+    speed = np.sqrt(u*u + v*v)
+
+    return u, v, speed
 
 
 world = gpd.read_file("10m_physical/ne_10m_land.shp")
@@ -31,27 +59,26 @@ def is_on_land(lat, lon):
 
 # Vessel Definition 
 class Vessel:
-    def __init__(self, speed, size, draft, fuel_efficiency):
-        self.speed = speed
+    def __init__(self, size, draft, fuel_efficiency):
         self.size = size
         self.draft = draft
         self.fuel_efficiency = fuel_efficiency
 
 
-vessel = Vessel(speed=15, size=200, draft=10, fuel_efficiency=10)
+vessel = Vessel(size=200, draft=10, fuel_efficiency=10)
 
 
 # Coordinates of Ports (from GPS data) 
-port_a_latlon = (35.6762, 139.6503) # Starting point 
-port_b_latlon = (33.7405, -118.2626) # Ending point
+port_a_latlon = (34.0195, -118.4912)  # Santa Monica / LA coast
+port_b_latlon = (40.5830, -73.8283)  # Rockaway Beach / Long Island coast
 
 lat_a, lon_a = port_a_latlon
 lat_b, lon_b = port_b_latlon
 
 
 # Input Scaling Factors 
-scaling_lat = 4
-scaling_lon = 1.3
+scaling_lat = 10
+scaling_lon = 1
 
 # Extended Grid Ranges 
 mid_lat = (lat_a + lat_b) / 2
@@ -74,10 +101,10 @@ else:
     except FileNotFoundError:
         print("No saved graph found. Generating from scratch...")
 
-        num_x = 40
-        num_y = 40
-        time_range = 20
-        time_steps = 20
+        num_x = 15
+        num_y = 15
+        time_range = 16
+        time_steps = 16
         time_increment = time_range / time_steps
         lat_increment = (lat_max - lat_min) / (num_x - 1)
         lon_increment = (lon_max - lon_min) / (num_y - 1)
@@ -104,14 +131,14 @@ else:
 
         graph = nx.DiGraph()
         graph.add_nodes_from(nodes)
+        del nodes
 
         moves = [
         (1, 0), (-1, 0), (0, 1), (0, -1),
         (1, 1), (1, -1), (-1, 1), (-1, -1),
         (0, 0)  # stay
         ]
-        epsilon_lat = 40
-        epsilon_lon = 40
+
         for k in range(time_steps - 1):
             for i in range(num_x):
                 for j in range(num_y):
@@ -124,111 +151,199 @@ else:
                             neighbor = f"Point_{ni}_{nj}_{k+1}"
                             graph.add_edge(current, neighbor)
 
-                        lat_left, lon_left, _ = node_positions[f"Point_0_{j}_{k}"]
-                        lat_right, lon_right, _ = node_positions[f"Point_{num_x-1}_{j}_{k}"]
+                        
+        epsilon_lon = 40
+        for k in range(time_steps - 1):
+                for i in range(num_x): 
+                    lat_left, lon_left, _ = node_positions[f"Point_{i}_{0}_{k}"]
+                    lat_right, lon_right, _ = node_positions[f"Point_{i}_{num_y - 1}_{k}"]
 
-                        if abs(lat_left - lat_right) < epsilon_lat and abs(lon_left - lon_right) < epsilon_lon:
-                            graph.add_edge(f"Point_0_{j}_{k}", f"Point_{num_x-1}_{j}_{k+1}")
-                            graph.add_edge(f"Point_{num_x-1}_{j}_{k}", f"Point_0_{j}_{k+1}")
-
+                    # if abs(lon_left + lon_right) < epsilon_lon:
+                    graph.add_edge(f"Point_{i}_{0}_{k}", f"Point_{i}_{num_y - 1}_{k+1}")
+                    graph.add_edge(f"Point_{i}_{num_y - 1}_{k+1}", f"Point_{i}_{0}_{k}")
+        
 
         def get_candidate_nodes(port_lat, port_lon, port_t, intcode):
-            north = None
-            south = None
-            east = None
-            west = None
+            candidates = []
 
             for node, (lat, lon, t) in node_positions.items():
-                if node.startswith("Point_"):
-                    if intcode == 0:
-                        if t == port_t + time_increment:
-                            # NORTH (lat greater than port)
-                            if lat > port_lat:
-                                if north is None or lat < north[1][0]:
-                                    north = (node, (lat, lon, t))
+                if not node.startswith("Point_"):
+                    continue
 
-                            # SOUTH (lat smaller than port)
-                            if lat < port_lat:
-                                if south is None or lat > south[1][0]:
-                                    south = (node, (lat, lon, t))
+                # Time filtering
+                if intcode == 0 and t != port_t + time_increment:
+                    continue
+                if intcode == 1 and t != port_t:
+                    continue
 
-                            # EAST (lon greater than port)
-                            if lon > port_lon:
-                                if east is None or lon < east[1][1]:
-                                    east = (node, (lat, lon, t))
+                # Compute distance 
+                dist = geodesic((port_lat, port_lon),(lat, lon)).kilometers
 
-                            # WEST (lon smaller than port)
-                            if lon < port_lon:
-                                if west is None or lon > west[1][1]:
-                                    west = (node, (lat, lon, t))
-                    if intcode == 1: 
-                        if t == port_t: 
-                            # NORTH (lat greater than port)
-                            if lat > port_lat:
-                                if north is None or lat < north[1][0]:
-                                    north = (node, (lat, lon, t))
+                candidates.append((dist, node))
 
-                            # SOUTH (lat smaller than port)
-                            if lat < port_lat:
-                                if south is None or lat > south[1][0]:
-                                    south = (node, (lat, lon, t))
+            # Sort by distance
+            candidates.sort(key=lambda x: x[0])
 
-                            # EAST (lon greater than port)
-                            if lon > port_lon:
-                                if east is None or lon < east[1][1]:
-                                    east = (node, (lat, lon, t))
-
-                            # WEST (lon smaller than port)
-                            if lon < port_lon:
-                                if west is None or lon > west[1][1]:
-                                    west = (node, (lat, lon, t))
-            
-            return [n[0] for n in [north, south, east, west] if n is not None]
+            # Return the 4 closest nodes
+            return [node for _, node in candidates[:2]]
 
         port_a_candidates = get_candidate_nodes(lat_a, lon_a, 0, 0)
         for candidate in port_a_candidates:
             graph.add_edge("Port_A_0", candidate)
 
-        for b_t in range (time_steps - 1):
-            port_b_candidates = get_candidate_nodes(lat_b, lon_b, b_t, 1)
-            for candidate in port_b_candidates:
-                graph.add_edge(candidate, f"Port_B_{b_t + 1}")
+        port_b_candidates = get_candidate_nodes(lat_b, lon_b, 0, 1)
+
+        pairs = set()
+        for node in port_b_candidates:
+            _, i, j, k = node.split("_")
+            pairs.add((int(i), int(j)))
+
+        for i, j in pairs:
+            for k in range(time_steps - 1):
+                graph.add_edge(f"Point_{i}_{j}_{k}", f"Port_B_{k + 1}")
+
+
+        land_mask = {}
+
+        for i in range(num_x):
+            for j in range(num_y):
+                lat = lat_min + i * lat_increment
+                lon = lon_min + j * lon_increment
+                land_mask[(i, j)] = is_on_land(lat, lon)
 
         land_nodes = []
         for i in range(num_x):
             for j in range(num_y):
+
+                if not land_mask[(i, j)]:
+                    continue  # water → skip
+
                 for k in range(time_steps):
                     node = f"Point_{i}_{j}_{k}"
-                    lat = node_positions[f"Point_{i}_{j}_{k}"][0]
-                    lon = node_positions[f"Point_{i}_{j}_{k}"][1]
-                    if is_on_land(lat, lon):
-                        land_nodes.append(node)
-                        
+                    land_nodes.append(node)
+        
         for node in land_nodes:
-            graph.remove_node(node)
-            node_positions.pop(node)
+            graph.remove_node(node) 
+            node_positions.pop(node) 
+        del land_nodes
 
-        def compute_cost(distance_km, wind_speed, wave_height, current_strength, traffic_density, vessel):
+
+        # Plot shortest path nodes
+        fig = plt.figure(figsize=(10, 10))
+        ax = plt.axes(projection=ccrs.PlateCarree())
+        ax.stock_img()
+        ax.set_ylim(lat_min, lat_max)
+
+
+        # Extract shortest path coordinates
+        path_lats = [pos[0] for pos in node_positions.values()]
+        path_lons = [pos[1] for pos in node_positions.values()]
+
+        # Plot nodes (points)
+        ax.scatter(
+            path_lons,
+            path_lats,
+            color='red',
+            s=5,
+            label='Path Nodes',
+            transform=ccrs.PlateCarree()
+        )
+
+        
+        lons = []
+        lats = []
+
+        def fix_dateline(lon1, lat1, lon2, lat2):
+            # detect wrap
+            if abs(lon1 - lon2) > 180:
+                if lon1 < 0:
+                    lon1 += 360
+                if lon2 < 0:
+                    lon2 += 360
+            return lon1, lat1, lon2, lat2
+
+
+        for u, v in graph.edges():
+
+            lat_u, lon_u, _ = node_positions[u]
+            lat_v, lon_v, _ = node_positions[v]
+
+            lon_u, lat_u, lon_v, lat_v = fix_dateline(lon_u, lat_u, lon_v, lat_v)
+
+            lons += [lon_u, lon_v, None]
+            lats += [lat_u, lat_v, None]
+
+
+        ax.plot(
+            lons,
+            lats,
+            color="gray",
+            linewidth=0.3,
+            alpha=0.4,
+            transform=ccrs.PlateCarree(),
+            zorder = 2
+        )
+
+        plt.legend()
+        plt.title("Nodes left")
+        plt.show()
+
+        print("Port_A_0 present:", "Port_A_0" in graph.nodes)
+
+        for k in range(time_steps):
+            print(f"Port_B_{k} present:", f"Port_B_{k}" in graph.nodes)
+
+        breakpoint()
+
+        def compute_cost(distance_km,
+                travel_vec,
+                wind_speed,
+                wind_vec,
+                wave_height,
+                current_strength,
+                traffic_density,
+                vessel):
+            
             wind_penalty = wind_speed * 0.1
             wave_penalty = wave_height * 2
             current_bonus = current_strength * 0.5
             traffic_penalty = traffic_density * 10
             base_cost = distance_km / vessel.fuel_efficiency
-            return base_cost + wind_penalty + wave_penalty + current_bonus + traffic_penalty
+            if np.linalg.norm(travel_vec) < 1e-9:
+                wind_cost = 0.0
+            else:
+                travel_unit = travel_vec / np.linalg.norm(travel_vec)
+                wind_alignment = np.dot(travel_unit, wind_vec)
+                wind_cost = 15 - 10 * wind_alignment
+
+            return base_cost + wind_penalty + wave_penalty + current_bonus + traffic_penalty + wind_cost
 
         for u, v in graph.edges():
             pos_u = node_positions[u][0:2]
             pos_v = node_positions[v][0:2]
             distance = geodesic(pos_u, pos_v).kilometers
+            travel_vec = np.array(pos_v) - np.array(pos_u)
 
-            wind_speed = np.random.uniform(5, 100)
-            wave_height = np.random.uniform(2, 100)
-            current_strength = np.random.uniform(2, 100)
-            traffic_density = np.random.uniform(2, 100)
+            lat, lon, t = node_positions[v]
+            wy, wx, wind_speed = GetWindfromCloseCoords(int(t), lat, lon)
+
+            wind_vec = np.array([wx, wy])
+            norm = np.linalg.norm(wind_vec)
+
+            if norm > 0:
+                wind_vec /= norm
+            else:
+                wind_vec = np.array([0.0, 0.0])
+
+            wave_height = np.random.uniform(2, 2)
+            current_strength = np.random.uniform(2, 2)
+            traffic_density = np.random.uniform(2, 2)
 
             cost = compute_cost(
                 distance,
+                travel_vec,
                 wind_speed,
+                wind_vec,
                 wave_height,
                 current_strength,
                 traffic_density,
@@ -237,7 +352,7 @@ else:
 
             graph[u][v].update({
                 "weight": cost,
-                "distance_km": distance,
+                "distance": distance,
                 "wind_speed": wind_speed,
                 "wave_height": wave_height,
                 "current_strength": current_strength,
@@ -264,55 +379,3 @@ else:
     shortest_cost = nx.dijkstra_path_length(graph, source="Port_A_0", target="Final_Destination", weight='weight')
     print("Shortest Path:", shortest_path)
     print("Total Cost:", shortest_cost)
-
-    
-    # Plot shortest path nodes
-    fig = plt.figure(figsize=(10, 10))
-    ax = plt.axes(projection=ccrs.PlateCarree())
-
-    # Set map extent
-    padding_lon = 0.05
-    padding_lat = 40
-    ax.set_extent([
-        lon_min - padding_lon, lon_max + padding_lon,
-        lat_min - padding_lat, lat_max + padding_lat
-    ])
-
-    # Map features
-    ax.add_feature(cfeature.COASTLINE)
-    ax.add_feature(cfeature.LAND, alpha=0.3)
-    ax.add_feature(cfeature.OCEAN, alpha=0.3)
-
-    # Extract shortest path coordinates
-    path_coords = [node_positions[node] for node in shortest_path[:-1]]
-    path_lats = [p[0] for p in path_coords]
-    path_lons = [p[1] for p in path_coords]
-
-    # Plot nodes (points)
-    ax.scatter(
-        path_lons,
-        path_lats,
-        color='red',
-        s=40,
-        label='Path Nodes',
-        transform=ccrs.PlateCarree()
-    )
-
-    # Plot connecting path line
-    ax.plot(
-        path_lons,
-        path_lats,
-        color='red',
-        linewidth=2,
-        label='Optimal Route',
-        transform=ccrs.PlateCarree(),
-        zorder = 1
-    )
-
-    # Highlight start/end
-    ax.scatter(lon_a, lat_a, color='green', s=100, label='Start', transform=ccrs.PlateCarree())
-    ax.scatter(lon_b, lat_b, color='blue', s=100, label='End', transform=ccrs.PlateCarree())
-
-    plt.legend()
-    plt.title("Optimal Route (Shortest Path Only)")
-    plt.show()
