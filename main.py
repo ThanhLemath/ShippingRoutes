@@ -27,6 +27,7 @@ for i in range(16):
         )
     )
 
+
 lat_ref = ds_list[0]["latitude"].values
 lon_ref = ds_list[0]["longitude"].values
 u_cache   = [ds["u10"].values for ds in ds_list]
@@ -40,21 +41,43 @@ v_cache   = [ds["v10"].values for ds in ds_list]
 #             np.allclose(lon_ref, lon_i, atol=1e-6)):
 #         raise ValueError(f"Grid mismatch at timestep {i}")
 
+global max_diff 
+max_diff = 0
+
 def find_initial_index(lat0, lon0):
-    dist2 = (lat_ref - lat0)**2 + ((lon_ref - lon0) * np.cos(np.radians(lat0)))**2
+    dlon = ((lon_ref - lon0 + 180) % 360 - 180)
+    # dist2 = ((dlon * 111.32 * np.cos(np.radians(lat0)))**2 +
+    #         ((lat_ref - lat0) * 111.32)**2)
+
+    dist2 = abs(dlon) + abs(lat_ref - lat0)
+
+    global max_diff
+    if np.min(dist2) > max_diff:
+        max_diff = np.min(dist2)
     return np.unravel_index(np.argmin(dist2), lat_ref.shape)
 
-def find_local_index(lat0, lon0, y_prev, x_prev, window=10):
-    y_min = max(0, y_prev - window)
-    y_max = min(lat_ref.shape[0], y_prev + window + 1)
 
-    x_min = max(0, x_prev - window)
-    x_max = min(lat_ref.shape[1], x_prev + window + 1)
+def find_local_index(lat0, lon0, y_prev, x_prev, x_window=20, y_window=10):
+    lon0 = lon0 % 360
+    y_min = max(0, y_prev - y_window)
+    y_max = min(lat_ref.shape[0], y_prev + y_window + 1)
+
+    x_min = max(0, x_prev - x_window)
+    x_max = min(lat_ref.shape[1], x_prev + x_window + 1)
 
     lat_sub = lat_ref[y_min:y_max, x_min:x_max]
     lon_sub = lon_ref[y_min:y_max, x_min:x_max]
 
-    dist2 = (lat_sub - lat0)**2 + ((lon_sub - lon0) * np.cos(np.radians(lat0)))**2
+    # dlon = ((lon_sub - lon0 + 180) % 360 - 180)
+    # dist2 = ((dlon * 111.32 * np.cos(np.radians(lat_sub)))**2 +
+    #         ((lat_sub - lat0) * 111.32)**2)
+
+    dlon = ((lon_sub - lon0 + 180) % 360 - 180)
+    dist2 = abs(dlon) + abs(lat_sub - lat0)
+    
+    global max_diff
+    if np.min(dist2) > max_diff:
+        max_diff = np.min(dist2)
 
     dy, dx = np.unravel_index(np.argmin(dist2), dist2.shape)
 
@@ -108,32 +131,43 @@ lat_max = mid_lat + lat_half_range
 lon_min = mid_lon - lon_half_range
 lon_max = mid_lon + lon_half_range
 
-num_lat = 15
-num_lon = 15
+num_lat = 30
+num_lon = 8
 time_range = 16
 time_steps = 16
 time_increment = time_range / time_steps
 lat_increment = (lat_max - lat_min) / (num_lat - 1)
 lon_increment = (lon_max - lon_min) / (num_lon - 1)
 
-
 index_map = {}
+# for i in range(num_lat):
+#     for j in range(num_lon):
+#         if i==0 and j==0:
+#             index_map[(0, 0)] = find_initial_index(lat_min, lon_min)
+
+#         elif i == 0 and j != 0:
+#             index_map[(i, j)] = find_local_index(lat_min + i * lat_increment, 
+#                                                  lon_min + j * lon_increment, 
+#                                                  index_map[(i, j - 1)][0],
+#                                                  index_map[(i, j - 1)][1])
+        
+#         elif i != 0:
+#             index_map[(i, j)] = find_local_index(lat_min + i * lat_increment, 
+#                                                  lon_min + j * lon_increment, 
+#                                                  index_map[(i - 1, j)][0],
+#                                                  index_map[(i - 1, j)][1])
+
+
 for i in range(num_lat):
     for j in range(num_lon):
         if i==0 and j==0:
             index_map[(0, 0)] = find_initial_index(lat_min, lon_min)
 
         elif i == 0 and j != 0:
-            index_map[(i, j)] = find_local_index(lat_min + i * lat_increment, 
-                                                 lon_min + j * lon_increment, 
-                                                 index_map[(i, j - 1)][0],
-                                                 index_map[(i, j - 1)][1])
+            index_map[(i, j)] = find_initial_index(lat_min + i * lat_increment, lon_min + j * lon_increment)
         
         elif i != 0:
-            index_map[(i, j)] = find_local_index(lat_min + i * lat_increment, 
-                                                 lon_min + j * lon_increment, 
-                                                 index_map[(i - 1, j)][0],
-                                                 index_map[(i - 1, j)][1])
+            index_map[(i, j)] = find_initial_index(lat_min + i * lat_increment, lon_min + j * lon_increment)
 
 y_b, x_b = find_initial_index(lat_b, lon_b)
 
@@ -434,14 +468,27 @@ else:
     # Total cost
     shortest_cost = nx.dijkstra_path_length(graph, source="Port_A_0", target="Final_Destination", weight='weight')
     print("Shortest Path:", shortest_path)
+
+    for node in shortest_path[1:-2]:
+        print(f"{node_positions[node][0]}, {node_positions[node][1] % 360}; ")
+        _, i, j, _ = node.split("_")
+        i = int(i)
+        j = int(j)
+        y_node, x_node = index_map[(i, j)]
+        lat_ds_list = ds_list[0]["latitude"][y_node, x_node].values
+        lon_ds_list = ds_list[0]["longitude"][y_node, x_node].values 
+        print(lat_ds_list, lon_ds_list)
+
     print("Total Cost:", shortest_cost)
+    print("Max difference: ", max_diff)
+
+
 
     # Plot shortest path nodes
     fig = plt.figure(figsize=(10, 10))
     ax = plt.axes(projection=ccrs.PlateCarree())
     ax.stock_img()
     ax.set_ylim(lat_min, lat_max)
-
 
     # Extract shortest path coordinates
     path_lats = [node_positions[node][0] for node in shortest_path[:-1]]
