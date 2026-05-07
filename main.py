@@ -41,11 +41,11 @@ v_cache   = [ds["v10"].values for ds in ds_list]
 #             np.allclose(lon_ref, lon_i, atol=1e-6)):
 #         raise ValueError(f"Grid mismatch at timestep {i}")
 
-global max_diff 
+global max_diff # Variable to see maximum difference between dataset coordinate and grid coordinate
 max_diff = 0
 
 def find_initial_index(lat0, lon0):
-    dlon = ((lon_ref - lon0 + 180) % 360 - 180)
+    dlon = ((lon_ref - lon0 + 180) % 360 - 180) # Dataset lon range is 0 to 360 and not -180 to 180, hence the conversion
     # dist2 = ((dlon * 111.32 * np.cos(np.radians(lat0)))**2 +
     #         ((lat_ref - lat0) * 111.32)**2)
 
@@ -189,18 +189,17 @@ else:
         node_positions["Port_A_0"] = (lat_a, lon_a, 0)
         nodes += ["Port_A_0"]
 
-        land_mask = {}
+        for k in range(time_steps): # Because we do not know when port B is reached, it is generated for every time step
+            t = k * time_increment
+            node_positions[f"Port_B_{k}"] = (lat_b, lon_b, t)
+            nodes += [f"Port_B_{k}"]
+
+        land_mask = {} # Creates land mask to remove nodes on land, this reduces mxnxt checks to just mxn
         for i in range(num_lat):
             for j in range(num_lon):
                 lat = lat_min + i * lat_increment
                 lon = lon_min + j * lon_increment
-                land_mask[(i, j)] = is_on_land(lat, lon)
-
-        
-        for k in range(time_steps):
-            t = k * time_increment
-            node_positions[f"Port_B_{k}"] = (lat_b, lon_b, t)
-            nodes += [f"Port_B_{k}"]
+                land_mask[(i, j)] = is_on_land(lat, lon) 
 
             for i in range(num_lat):
                 for j in range(num_lon):
@@ -221,7 +220,7 @@ else:
         moves = [
         (1, 0), (-1, 0), (0, 1), (0, -1),
         (1, 1), (1, -1), (-1, 1), (-1, -1)
-        ]
+        ] # Create edges in 8 directions which only move foreward in time
 
         for k in range(time_steps - 1):
             for i in range(num_lat):
@@ -242,7 +241,7 @@ else:
                             graph.add_edge(current, neighbor)
 
                         
-        epsilon_lon = 1
+        epsilon_lon = 1 # This creates a longitudal "wrap-around" for the graph if the beginning and end nodes are close enough
         for k in range(time_steps - 1):
                 for i in range(num_lat): 
                     if f"Point_{i}_{0}_{k}" not in graph or f"Point_{i}_{num_lon - 1}_{k}" not in graph:
@@ -256,7 +255,8 @@ else:
                         graph.add_edge(f"Point_{i}_{num_lon - 1}_{k}", f"Point_{i}_{0}_{k+1}")
         
 
-        def get_candidate_nodes(port_lat, port_lon, port_t, intcode):
+        def get_candidate_nodes(port_lat, port_lon, port_t, intcode): 
+            # Because the two ports are generated separately from the other nodes, they have to be connected back to the graph using the closest nodes. Port A connects forwards but port B_k's connect backwards, hence the intcode
             candidates = []
 
             for node, (lat, lon, t) in node_positions.items():
@@ -283,9 +283,9 @@ else:
         port_a_candidates = get_candidate_nodes(lat_a, lon_a, 0, 0)
         for candidate in port_a_candidates:
             graph.add_edge("Port_A_0", candidate)
-
-        port_b_candidates = get_candidate_nodes(lat_b, lon_b, 0, 1)
-
+        
+        # The candidate nodes are spatial, and do not change over time, so the same nodes can be connected over all other time steps
+        port_b_candidates = get_candidate_nodes(lat_b, lon_b, 0, 1) 
         pairs = set()
         for node in port_b_candidates:
             _, i, j, k = node.split("_")
@@ -326,8 +326,8 @@ else:
             return base_cost + wind_penalty + wave_penalty + current_bonus + traffic_penalty + wind_cost
 
         for u, v in graph.edges():
-
-            if u == "Final_Destination" or v == "Final_Destination":
+            # When extracted from the .pkl file, final destination has no node position, so it cannot be considered
+            if u == "Final_Destination" or v == "Final_Destination": 
                 continue
 
             if v.startswith("Point_"):
